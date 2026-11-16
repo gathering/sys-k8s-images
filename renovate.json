@@ -1,0 +1,66 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "docker:pinDigests"
+  ],
+  "timezone": "Europe/Oslo",
+  "gitIgnoredAuthors": [
+    "github-actions@users.noreply.github.com"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Versions annotated with '# renovate: datasource=... depName=...' on the line above. A version may be pinned by digest, <tag>@sha256:<digest>",
+      "managerFilePatterns": [
+        "/^Makefile$/",
+        "/^\\.github/workflows/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: extractVersion=(?<extractVersion>\\S+))?\\s+[\\w.-]+\\s*(?::=|=|:)\\s*\"?(?<currentValue>[^\"\\s@]+)(?:@(?<currentDigest>sha256:[0-9a-f]+))?\"?"
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "A new digest of the same base image tag goes to main without a PR once the build passes (README, How it fits together)",
+      "matchFileNames": [
+        "images/**"
+      ],
+      "matchUpdateTypes": [
+        "digest",
+        "pinDigest"
+      ],
+      "automerge": true,
+      "automergeType": "branch"
+    },
+    {
+      "description": "A new upstream version gets a PR, since our change may no longer apply to it",
+      "matchFileNames": [
+        "images/**"
+      ],
+      "matchUpdateTypes": [
+        "major",
+        "minor",
+        "patch"
+      ],
+      "labels": [
+        "upstream-version"
+      ]
+    },
+    {
+      "description": "Build tools (Python, PyYAML, the lint images, GitHub Actions): one PR a week, majors included",
+      "matchFileNames": [
+        ".python-version",
+        "requirements.txt",
+        "Makefile",
+        ".github/workflows/**"
+      ],
+      "groupName": "build tools",
+      "separateMajorMinor": false,
+      "schedule": [
+        "on monday"
+      ]
+    }
+  ]
+}

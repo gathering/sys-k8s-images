@@ -1,0 +1,209 @@
+name: Build
+
+# On every push:
+#
+# 1. Bump the version of each changed image (README, Versions). If that
+#    changes anything, commit it and stop. The commit gets a second run.
+# 2. Check, build and test. On a branch, the images changed since it left
+#    main, and nothing is pushed. On main, every image whose version is not
+#    pushed yet, then push.
+#
+# A push with GITHUB_TOKEN starts no workflow, so the commit cannot loop.
+# The second run is started with workflow_dispatch instead. GitHub hides
+# such runs on pull requests, so it also sets a commit status named build.
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+# One run at a time per branch.
+concurrency:
+  group: build-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # To start the second run after a commit-back.
+      actions: write
+      packages: read
+    outputs:
+      images: ${{ steps.plan.outputs.images }}
+      sha: ${{ steps.plan.outputs.sha }}
+      committed: ${{ steps.commit.outputs.committed }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # The branch, not a detached commit, so that a bump can be pushed.
+          ref: ${{ github.ref }}
+          # All of history: versions are compared with the commits that set
+          # them.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version-file: .python-version
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Bump versions
+        run: make bump
+
+      - name: Commit and push the bump
+        id: commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "$(git status --porcelain images/)" ]; then
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config --local user.email "github-actions@users.noreply.github.com"
+          git config --local user.name "github-actions"
+          git add images/*/version
+          git commit -m "chore: bump image versions"
+          git push
+          gh workflow run build.yaml --ref "$GITHUB_REF_NAME" \
+            || { sleep 10; gh workflow run build.yaml --ref "$GITHUB_REF_NAME"; }
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Check versions
+        if: steps.commit.outputs.committed == 'false'
+        run: make check
+
+      - name: Log in to the registry
+        if: steps.commit.outputs.committed == 'false'
+        run: echo "${{ github.token }}" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+
+      - name: Choose the images to build
+        id: plan
+        if: steps.commit.outputs.committed == 'false'
+        run: |
+          if [ "$GITHUB_REF_NAME" = main ]; then
+            images=$(python3 scripts/images.py list | jq -Rnc '[inputs | select(. != "")]')
+          else
+            # Every image when the branch shares no history with main.
+            base=$(git merge-base HEAD origin/main || echo none)
+            images=$(python3 scripts/images.py changed "$base")
+            # A new version that is already taken would never be pushed.
+            # Without a merge base, no version is new to this branch.
+            for image in $(if [ "$base" != none ]; then echo "$images" | jq -r '.[]'; fi); do
+              previous=$(git show "$base:images/$image/version" 2>/dev/null || true)
+              if [ "$previous" = "$(cat "images/$image/version")" ]; then
+                continue
+              fi
+              status=0
+              python3 scripts/images.py published "$image" || status=$?
+              if [ "$status" = 0 ] || [ "$status" = 3 ]; then
+                echo "::error::images/$image/version: $(python3 scripts/images.py ref "$image") is already in the registry. Merge main into the branch and run make bump, or raise it"
+                exit 1
+              elif [ "$status" != 1 ]; then
+                exit 1
+              fi
+            done
+          fi
+          echo "Images: $images"
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.committed == 'false' && needs.prepare.outputs.images != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.prepare.outputs.images) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # The commit prepare checked, even if the branch has moved since.
+          ref: ${{ needs.prepare.outputs.sha }}
+          # All of history, to compare with the commit a pushed tag came from.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version-file: .python-version
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Log in to the registry
+        run: echo "${{ github.token }}" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+
+      # A tag pushed from other content means a change that would never
+      # ship, so the run fails.
+      - name: Skip a version that is already pushed
+        id: published
+        if: github.ref_name == 'main'
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          status=0
+          python3 scripts/images.py published "$IMAGE" || status=$?
+          case $status in
+            0) echo "$(python3 scripts/images.py ref "$IMAGE") is already pushed"
+               echo "skip=true" >> "$GITHUB_OUTPUT" ;;
+            1) echo "skip=false" >> "$GITHUB_OUTPUT" ;;
+            3) echo "::error::images/$IMAGE/version: the tag is pushed from other content. Raise it"
+               exit 1 ;;
+            *) exit 1 ;;
+          esac
+
+      - name: Build and test
+        if: steps.published.outputs.skip != 'true'
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: make test IMAGE="$IMAGE"
+
+      - name: Push
+        if: github.ref_name == 'main' && steps.published.outputs.skip == 'false'
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          ref=$(python3 scripts/images.py ref "$IMAGE")
+          docker tag "local/$IMAGE" "$ref"
+          docker push "$ref"
+          echo "Pushed $ref" >> "$GITHUB_STEP_SUMMARY"
+
+  # One check for the whole run, and the commit status for the second run.
+  result:
+    needs: [prepare, build]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+
+    steps:
+      - name: Fail when a job failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+
+      - name: Set the build status for the pull request
+        # Not when this run committed a bump: that commit gets a run of its own.
+        if: always() && github.event_name == 'workflow_dispatch' && needs.prepare.outputs.committed != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.prepare.outputs.sha || github.sha }}
+          STATE: ${{ job.status == 'success' && 'success' || 'failure' }}
+          DESCRIPTION: ${{ job.status == 'success' && 'Images built and tested' || 'Check, build or test failed' }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
+            -f state="$STATE" -f context=build \
+            -f description="$DESCRIPTION" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
