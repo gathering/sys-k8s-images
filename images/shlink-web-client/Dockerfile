@@ -1,6 +1,6 @@
 # shlink-web-client that also listens on IPv6, for IPv6-only pods. Upstream
 # declined the change: https://github.com/shlinkio/shlink-web-client/pull/2053
-FROM shlinkio/shlink-web-client:4.9.0@sha256:9ea53f612d361de240555036065e2b8ea0cd0411b0125afaf2f7d39f2a928f18
+FROM shlinkio/shlink-web-client:4.9.1@sha256:732c291bcc099d6ff51038bcfba374be87494fa2916683a44d3135ea57cbe935
 
 # The grep fails the build when upstream's listen line has changed.
 USER 0
